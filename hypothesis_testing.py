@@ -15,6 +15,9 @@ from scipy import stats
 
 Alternative = Literal["greater", "less", "two-sided"]
 
+# Wilcoxon rank-sum: n1, n2 > 10 → xấp xỉ Z; ngược lại → phân phối chính xác / tra bảng U
+WILCOXON_RANK_SUM_Z_MIN_N = 10
+
 # Danh mục loại kiểm định: mô tả tiếng Việt + tham số bắt buộc khi gọi hypothesis_test(...)
 TEST_PARAMS: dict[str, dict[str, str | tuple[str, ...]]] = {
     # --- Chương 04_01: kiểm định có tham số ---
@@ -35,7 +38,11 @@ TEST_PARAMS: dict[str, dict[str, str | tuple[str, ...]]] = {
         "tham_so": ("x1", "x2", "sigma1", "sigma2", "n1", "n2"),
     },
     "t_two_means_independent": {
-        "mo_ta": "Kiểm định t khác biệt hai trung bình (2 mẫu độc lập, σ chưa biết)",
+        "mo_ta": "Kiểm định t khác biệt hai trung bình (2 mẫu độc lập, σ chưa biết, gộp phương sai)",
+        "tham_so": ("x1", "x2", "s1", "s2", "n1", "n2"),
+    },
+    "t_two_means_welch": {
+        "mo_ta": "Kiểm định Welch t khác biệt hai trung bình (2 mẫu độc lập, không giả định phương sai bằng nhau)",
         "tham_so": ("x1", "x2", "s1", "s2", "n1", "n2"),
     },
     "t_paired": {
@@ -68,7 +75,7 @@ TEST_PARAMS: dict[str, dict[str, str | tuple[str, ...]]] = {
         "tham_so": ("x", "y"),
     },
     "wilcoxon_rank_sum": {
-        "mo_ta": "Kiểm định Wilcoxon tổng hạng / Mann-Whitney (2 mẫu độc lập, phi tham số)",
+        "mo_ta": "Kiểm định Wilcoxon tổng hạng / Mann-Whitney (2 mẫu độc lập; trả U và xấp xỉ Z)",
         "tham_so": ("sample1", "sample2"),
     },
     "chi2_independence": {
@@ -147,7 +154,9 @@ def _z_critical(alpha: float, alternative: Alternative) -> float | tuple[float, 
     return float(stats.norm.ppf(alpha))
 
 
-def _t_critical(df: int, alpha: float, alternative: Alternative) -> float | tuple[float, float]:
+def _t_critical(
+    df: float, alpha: float, alternative: Alternative
+) -> float | tuple[float, float]:
     if alternative == "two-sided":
         t = float(stats.t.ppf(1 - alpha / 2, df))
         return (-t, t)
@@ -164,7 +173,7 @@ def _z_pvalue(z: float, alternative: Alternative) -> float:
     return float(stats.norm.cdf(z))
 
 
-def _t_pvalue(t: float, df: int, alternative: Alternative) -> float:
+def _t_pvalue(t: float, df: float, alternative: Alternative) -> float:
     if alternative == "two-sided":
         return float(2 * stats.t.sf(abs(t), df))
     if alternative == "greater":
@@ -178,7 +187,12 @@ def _t_pvalue(t: float, df: int, alternative: Alternative) -> float:
 
 
 def _z_mean_sigma_known(
-    x_bar: float, mu0: float, sigma: float, n: int, alpha: float, alternative: Alternative
+    x_bar: float,
+    mu0: float,
+    sigma: float,
+    n: int,
+    alpha: float,
+    alternative: Alternative,
 ) -> dict[str, Any]:
     se = sigma / np.sqrt(n)
     z = (x_bar - mu0) / se
@@ -300,6 +314,49 @@ def _t_two_means_independent(
             "s1": s1,
             "s2": s2,
             "sp": float(sp),
+            "n1": n1,
+            "n2": n2,
+            "df": df,
+            "se": float(se),
+        },
+    )
+
+
+def _t_two_means_welch(
+    x1: float,
+    x2: float,
+    s1: float,
+    s2: float,
+    n1: int,
+    n2: int,
+    alpha: float,
+    alternative: Alternative,
+    d0: float = 0.0,
+) -> dict[str, Any]:
+    v1 = s1**2
+    v2 = s2**2
+    se = np.sqrt(v1 / n1 + v2 / n2)
+    t = ((x1 - x2) - d0) / se
+    num = (v1 / n1 + v2 / n2) ** 2
+    den = (v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1)
+    df = float(num / den)
+    return _result(
+        "t_two_means_welch",
+        alpha,
+        alternative,
+        t,
+        "T",
+        _t_pvalue(t, df, alternative),
+        _t_critical(df, alpha, alternative),
+        f"t_{{alpha; {df:.2f}}}",
+        {
+            "x1": x1,
+            "x2": x2,
+            "d0": d0,
+            "s1": s1,
+            "s2": s2,
+            "s1_2": float(v1),
+            "s2_2": float(v2),
             "n1": n1,
             "n2": n2,
             "df": df,
@@ -468,7 +525,9 @@ def _sign_test(
     n_pos = int(np.sum(diffs > 0))
     n_neg = n - n_pos
     if alternative == "two-sided":
-        p_value = float(2 * min(stats.binom.cdf(n_pos, n, 0.5), stats.binom.sf(n_pos - 1, n, 0.5)))
+        p_value = float(
+            2 * min(stats.binom.cdf(n_pos, n, 0.5), stats.binom.sf(n_pos - 1, n, 0.5))
+        )
     elif alternative == "greater":
         p_value = float(stats.binom.sf(n_pos - 1, n, 0.5))
     else:
@@ -508,21 +567,60 @@ def _wilcoxon_rank_sum(
     sample1: list, sample2: list, alpha: float, alternative: Alternative
 ) -> dict[str, Any]:
     s1, s2 = _as_array(sample1), _as_array(sample2)
-    stat, p_value = stats.mannwhitneyu(s1, s2, alternative=alternative)
-    return _result(
+    n1, n2 = len(s1), len(s2)
+    u, p_value = stats.mannwhitneyu(s1, s2, alternative=alternative)
+    mu_u = n1 * n2 / 2.0
+    sigma_u = float(np.sqrt(n1 * n2 * (n1 + n2 + 1) / 12))
+    z = (float(u) - mu_u) / sigma_u
+    use_z_approx = n1 > WILCOXON_RANK_SUM_Z_MIN_N and n2 > WILCOXON_RANK_SUM_Z_MIN_N
+
+    if use_z_approx:
+        z_crit = _z_critical(alpha, alternative)
+        if alternative == "two-sided":
+            assert isinstance(z_crit, tuple)
+            z_threshold = z_crit[1]
+            critical_name = "Z_alpha/2"
+        else:
+            z_threshold = float(z_crit)  # type: ignore[arg-type]
+            critical_name = "Z_alpha"
+        # Bước 3 (mẫu lớn): 1 phía |Z| > Z_α; 2 phía |Z| > Z_{α/2}
+        reject = abs(z) > z_threshold
+        method = "z_approx"
+    else:
+        z_crit = None
+        z_threshold = None
+        critical_name = "bang_W"
+        reject = float(p_value) < alpha
+        method = "exact"
+
+    out = _result(
         "wilcoxon_rank_sum",
         alpha,
         alternative,
-        float(stat),
+        float(u),
         "U",
         float(p_value),
-        None,
-        "tra_bang_hoac_Z_xap_si",
-        {"n1": len(s1), "n2": len(s2)},
+        z_threshold,
+        critical_name,
+        {
+            "n1": n1,
+            "n2": n2,
+            "mu_u": mu_u,
+            "sigma_u": sigma_u,
+            "z": float(z),
+            "method": method,
+            "use_z_approx": use_z_approx,
+        },
     )
+    out["reject_h0"] = reject
+    if z_crit is not None:
+        out["z_critical"] = z_crit
+    return out
 
 
-def _chi2_independence(observed: list, alpha: float, alternative: Alternative) -> dict[str, Any]:
+def _chi2_independence(
+    observed: list, alpha: float, alternative: Alternative
+) -> dict[str, Any]:
     table = np.asarray(observed, dtype=float)
     chi2, p_value, df, expected = stats.chi2_contingency(table)
     crit = float(stats.chi2.ppf(1 - alpha, df))
@@ -570,6 +668,7 @@ _HANDLERS = {
     "z_proportion": _z_proportion,
     "z_two_means_independent": _z_two_means_independent,
     "t_two_means_independent": _t_two_means_independent,
+    "t_two_means_welch": _t_two_means_welch,
     "t_paired": _t_paired,
     "z_two_proportions": _z_two_proportions,
     "chi2_variance": _chi2_variance,
